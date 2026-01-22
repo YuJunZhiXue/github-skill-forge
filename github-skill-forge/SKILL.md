@@ -31,8 +31,8 @@ tags: ["github", "skill-forge", "meta-skill", "automation", "integration", "CLI"
 - Git 克隆失败自动重试
 
 ### 4. 标准化输出
-- 自动生成符合 Trae 规范的技能结构
-- 统一的目录布局（src/, scripts/, references/, context_bundle.md）
+- 自动生成符合规范的技能结构
+- 统一的目录布局（scripts/, references/, context_bundle.md）
 - 预置 SKILL.md 模板
 
 ## 快速开始
