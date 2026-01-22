@@ -1,47 +1,4 @@
 #!/usr/bin/env python3
-"""
-GitHub Skill Forge - 全功能自动化工具
-
-这个脚本自动化了将任意 GitHub 仓库转换为标准化 Trae 技能的全过程。
-
-## 核心功能
-- 一键克隆 GitHub 仓库并自动创建标准技能目录结构
-- 自动生成 Lite-RAG 上下文聚合文件
-- 支持代理模式自动切换，解决网络访问问题
-- 自动清理 .git 文件夹以减小存储体积
-- 支持批量安装、自定义模板、强制覆盖等高级功能
-- 提供智能错误处理和自动恢复机制
-
-## 使用方法
-    基本用法: python forge.py <github_url> [skill_name]
-    批量安装: python forge.py --batch urls.txt
-    试运行:   python forge.py <url> --dry-run
-    强制覆盖: python forge.py <url> --force
-
-## 配置文件
-    支持 .skill-forge.toml 配置文件，配置项：
-    - default_skill_name: 默认技能名称模板
-    - skip_patterns: 跳过的文件模式
-    - proxy_enabled: 是否启用代理
-    - clone_depth: 克隆深度（默认1）
-    - max_retries: 最大重试次数（默认3）
-    - timeout: 超时时间（秒）
-
-## 依赖文件支持
-    自动检测并收集以下依赖文件：
-    - requirements.txt / Pipfile / pyproject.toml (Python)
-    - package.json (Node.js)
-    - go.mod (Go)
-    - Cargo.toml (Rust)
-    - pom.xml / build.gradle (Java)
-    - Gemfile (Ruby)
-
-## 作者
-    LO (https://github.com/)
-
-## 版本
-    v2.0 (2026-01)
-"""
 
 import sys
 import os
@@ -55,6 +12,34 @@ import signal
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+# 尝试加载本地 .env 文件
+def load_env_file(env_path: Path):
+    """
+    轻量级加载 .env 文件到环境变量
+    """
+    if not env_path.exists():
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key.strip()] = value.strip()
+    except Exception:
+        pass
+
+# 加载脚本同目录或父目录下的 .env
+env_paths = [
+    Path(__file__).parent / ".env",
+    Path(__file__).parent.parent / ".env",
+    Path.cwd() / ".env"
+]
+for env_p in env_paths:
+    load_env_file(env_p)
 from typing import Optional, List, Dict, Set, Tuple, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -162,7 +147,14 @@ class ForgeConfig:
     max_retries: int = 3
     timeout: int = 60
 
-    # 代理配置
+    # 镜像配置
+    clone_mirrors: List[str] = field(
+        default_factory=lambda: [
+            "https://github.com",
+            "https://kkgithub.com",
+            "https://gitclone.com/github.com",
+        ]
+    )
     proxy_enabled: bool = True
     proxy_url: str = "gitclone.com/github.com/"
 
@@ -205,6 +197,22 @@ class ForgeConfig:
     max_file_count: int = 100
     max_doc_size: int = 20000
 
+    # 安全配置
+    min_stars: int = 100
+    no_safety_check: bool = False
+
+    # 镜像配置
+    api_mirrors: List[str] = field(
+        default_factory=lambda: [
+            "https://api.github.com",
+            "https://gh-api.vps.sc",
+            "https://api.gitmirror.com",
+            "https://ghproxy.net/https://api.github.com",
+            "https://gh.api.99988866.xyz",
+        ]
+    )
+    current_api_base: str = "https://api.github.com"
+
     @classmethod
     def load_from_file(cls, config_path: Path) -> "ForgeConfig":
         """从配置文件加载配置"""
@@ -233,6 +241,8 @@ class ForgeConfig:
                 force=config_data.get("force", False),
                 max_file_count=config_data.get("max_file_count", cls().max_file_count),
                 max_doc_size=config_data.get("max_doc_size", cls().max_doc_size),
+                min_stars=config_data.get("min_stars", cls().min_stars),
+                no_safety_check=config_data.get("no_safety_check", cls().no_safety_check),
             )
         except Exception as e:
             print(f"{Colors.warning('警告')}: 无法加载配置文件 {config_path}: {e}")
@@ -359,6 +369,71 @@ class ProgressBar:
 
 
 # ==================== 工具函数 ====================
+def get_repo_info(url: str) -> Tuple[str, str]:
+    """
+    从 URL 提取 owner 和 repo
+    """
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    
+    # 處理 SSH 格式 git@github.com:owner/repo
+    if url.startswith("git@"):
+        match = re.match(r"git@github\.com:([\w.-]+)/([\w.-]+)", url)
+        if match:
+            return match.group(1), match.group(2)
+            
+    parts = url.split("/")
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    
+    raise ForgeError(f"无法从 URL 提取仓库信息: {url}")
+
+
+def make_api_request(url_path: str, config: ForgeConfig) -> Any:
+    """
+    发送带镜像重试的 API 请求
+    """
+    # 尝试从环境变量获取 GITHUB_TOKEN
+    token = os.environ.get("GITHUB_TOKEN")
+    
+    for base_url in config.api_mirrors:
+        api_url = f"{base_url.rstrip('/')}/{url_path.lstrip('/')}"
+        try:
+            # 针对 ghproxy 的特殊处理
+            if "ghproxy.net" in base_url:
+                # ghproxy.net 通常用于加速 raw/archive，对于 API 接口可能需要特定头
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                }
+            else:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+            
+            if token and "github.com" in base_url and "ghproxy" not in base_url:
+                headers["Authorization"] = f"token {token}"
+                
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as response:
+                config.current_api_base = base_url
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            if e.code == 403 and "ghproxy" in base_url:
+                # ghproxy 经常报 403，静默跳过
+                continue
+            if config.verbose:
+                print(f"{Colors.WARNING}镜像 {base_url} 返回 HTTP {e.code}: {e.reason}")
+        except Exception as e:
+            if config.verbose:
+                print(f"{Colors.WARNING}镜像 {base_url} 请求失败: {e}")
+            continue
+    raise ForgeError(f"所有 API 镜像均无法访问: {url_path}。请检查网络或配置代理。")
+
+
 def get_repo_name(url: str) -> str:
     """
     从 URL 提取仓库名称
@@ -388,14 +463,8 @@ def get_repo_name(url: str) -> str:
 def validate_url(url: str) -> bool:
     """
     验证 GitHub URL 格式
-
-    Args:
-        url: 要验证的 URL
-
-    Returns:
-        URL 是否有效
     """
-    # GitHub URL 模式
+    # GitHub URL 模式 (支持 .git 后缀和各种变体)
     patterns = [
         r"^https://github\.com/[\w.-]+/[\w.-]+/?$",
         r"^https://github\.com/[\w.-]+/[\w.-]+\.git/?$",
@@ -472,82 +541,176 @@ def get_file_tree(
     return "\n".join(tree_str)
 
 
-def check_repository_safety(url: str) -> Tuple[bool, str]:
+def check_repository_safety(url: str, config: ForgeConfig) -> Tuple[bool, str, str]:
     """
-    检查仓库安全性
-
-    Args:
-        url: GitHub 仓库 URL
+    检查仓库安全性并获取描述
 
     Returns:
-        (是否安全, 安全信息)
+        (是否安全, 统计信息, 描述)
     """
     try:
         # 提取 owner/repo
-        parts = url.rstrip("/").split("/")
-        if len(parts) < 2:
-            return False, "无效的 URL 格式"
-
+        url = url.rstrip("/")
+        if url.endswith(".git"):
+            url = url[:-4]
+        parts = url.split("/")
         owner = parts[-2]
-        repo = parts[-1].replace(".git", "")
+        repo = parts[-1]
 
-        # 获取仓库信息（使用 GitHub API）
-        api_url = f"https://api.github.com/repos/{owner}/{repo}"
+        data = make_api_request(f"repos/{owner}/{repo}", config)
 
-        req = urllib.request.Request(
-            api_url, headers={"User-Agent": "GitHub-Skill-Forge"}
-        )
-        req.timeout = 10  # 设置超时
+        stars = data.get("stargazers_count", 0)
+        forks = data.get("forks_count", 0)
+        license_info = data.get("license", {})
+        license_id = license_info.get("spdx_id", "未知") if license_info else "未知"
+        description = data.get("description", "")
 
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode())
+        # 生成安全报告
+        safety_info = [
+            f"Stars: {stars:,}",
+            f"Forks: {forks:,}",
+            f"许可证: {license_id}"
+        ]
 
-            stars = data.get("stargazers_count", 0)
-            forks = data.get("forks_count", 0)
-            updated_at = data.get("updated_at", "")
-
-            # 检查是否活跃（最近一次更新在一年内）
-            is_active = True
-            if updated_at:
-                # 解析更新时间（处理时区）
-                try:
-                    last_update = datetime.fromisoformat(
-                        updated_at.replace("Z", "+00:00")
-                    )
-                    # 使用 UTC 时间进行比较
-                    now = (
-                        datetime.now(last_update.tzinfo)
-                        if last_update.tzinfo
-                        else datetime.now()
-                    )
-                    is_active = (now - last_update).days < 365
-                except Exception:
-                    is_active = True  # 解析失败时假设活跃
-
-            # 生成安全报告
-            safety_info = []
-            safety_info.append(f"Stars: {stars:,}")
-            safety_info.append(f"Forks: {forks:,}")
-            safety_info.append(f"状态: {'活跃' if is_active else '不活跃'}")
-            safety_info.append(
-                f"许可证: {data.get('license', {}).get('spdx_id', '未知')}"
+        # 严格安全检查
+        if stars < config.min_stars:
+            return (
+                False,
+                f"仓库 Stars ({stars}) 低于设定的金标阈值 ({config.min_stars})。详情: {'; '.join(safety_info)}",
+                description
             )
 
-            # 基础安全检查
-            if stars < 10:
-                return (
-                    False,
-                    f"仓库Stars数量过低，可能不够安全。详情: {'; '.join(safety_info)}",
-                )
+        return True, "; ".join(safety_info), description
 
-            return True, "; ".join(safety_info)
-
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return False, "仓库不存在或无法访问"
-        return False, f"HTTP 错误: {e.code}"
     except Exception as e:
-        return False, f"检查失败: {str(e)}"
+        return False, f"安全检查失败: {str(e)}", ""
+
+
+def fetch_github_contents(owner: str, repo: str, path: str, config: ForgeConfig) -> Any:
+    """递归在线获取 GitHub 内容"""
+    return make_api_request(f"repos/{owner}/{repo}/contents/{path}", config)
+
+
+def download_file_content(download_url: str) -> str:
+    """通过直链下载文件内容"""
+    try:
+        # 针对镜像站，可能需要替换下载域名，这里先尝试原链接
+        req = urllib.request.Request(download_url)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        return f"下载失败: {e}"
+
+
+def online_repo_scanner(url: str, config: ForgeConfig) -> Dict[str, Any]:
+    """
+    全在线扫描仓库，不克隆。支持递归扫描关键目录和抓取入口代码。
+    """
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    
+    parts = url.split("/")
+    if len(parts) < 2:
+        raise ForgeError(f"无法解析 URL 中的 owner 和 repo: {url}")
+        
+    owner = parts[-2]
+    repo = parts[-1]
+
+    print(f"{Colors.INFO}正在进行全在线扫描 (镜像: {config.current_api_base})...")
+
+    results = {
+        "tree": [],
+        "key_docs": {},
+        "dependencies": {},
+        "core_code": {},
+        "entry_files": {},  # 分開存儲入口文件
+        "language": "Unknown"
+    }
+
+    # 待扫描的队列 (path, depth)
+    scan_queue = [("", 0)]
+    scanned_paths = set()
+    max_depth = 2  # 增加深度到2层，以覆盖更多子目录
+
+    # 核心代码入口文件名 (擴展列表)
+    entry_points = {
+        "main.py", "__main__.py", "app.py", "cli.py", "core.py",
+        "index.js", "main.js", "app.js", "server.js",
+        "index.ts", "main.ts", "app.ts",
+        "main.go", "lib.rs", "main.rs", "mod.rs",
+        "App.java", "Main.java",
+        "application.rb", "main.rb"
+    }
+    # 值得递归的目录名
+    interest_dirs = {"src", "lib", "app", "bin", "include", "pkg", "internal", "cmd", repo.lower().replace("-", "_"), repo.lower()}
+
+    while scan_queue:
+        current_path, depth = scan_queue.pop(0)
+        if current_path in scanned_paths or depth > max_depth:
+            continue
+        
+        scanned_paths.add(current_path)
+        try:
+            items = fetch_github_contents(owner, repo, current_path, config)
+            if not isinstance(items, list): continue
+
+            for item in items:
+                rel_path = f"{current_path}/{item['name']}".lstrip("/")
+                results["tree"].append(f"[{item['type']}] {rel_path}")
+
+                # 1. 关键文档 (只在根目录或一级目录)
+                if item["type"] == "file" and any(re.match(p, item["name"], re.I) for p in ["README.*", "LICENSE.*", "CONTRIBUTING.*"]):
+                    if len(results["key_docs"]) < 5:  # 限制数量
+                        print(f"{Colors.PROGRESS}抓取文档: {rel_path}")
+                        results["key_docs"][rel_path] = download_file_content(item["download_url"])
+
+                # 2. 依赖项
+                dep_map = {
+                    "requirements.txt": "Python", "package.json": "Node.js", 
+                    "go.mod": "Go", "Cargo.toml": "Rust", "pyproject.toml": "Python",
+                    "setup.py": "Python", "pom.xml": "Java", "Gemfile": "Ruby"
+                }
+                if item["name"] in dep_map:
+                    # 如果尚未確定語言，則更新
+                    if results["language"] == "Unknown":
+                        results["language"] = dep_map[item["name"]]
+                        print(f"{Colors.SUCCESS}識別到主要語言: {results['language']} ({item['name']})")
+                    
+                    if item["name"] not in results["dependencies"]:
+                        results["dependencies"][item["name"]] = download_file_content(item["download_url"])
+
+                # 3. 入口文件與核心代碼
+                if item["type"] == "file":
+                    is_entry = item["name"].lower() in entry_points
+                    is_code_file = item["name"].endswith((".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".cs", ".rb", ".php", ".sh"))
+                    
+                    # 過濾測試和文檔
+                    if any(x in rel_path.lower() for x in ["/tests/", "/test/", "/docs/", "/examples/", "/site-packages/"]):
+                        continue
+
+                    if is_entry:
+                        if len(results["entry_files"]) < 5:
+                            print(f"{Colors.PROGRESS}抓取入口代碼: {rel_path}")
+                            code = download_file_content(item["download_url"])
+                            results["entry_files"][rel_path] = "\n".join(code.splitlines()[:100])
+                    elif is_code_file and depth > 0:
+                        if len(results["core_code"]) < 10:
+                            print(f"{Colors.PROGRESS}抓取核心代碼: {rel_path}")
+                            code = download_file_content(item["download_url"])
+                            results["core_code"][rel_path] = "\n".join(code.splitlines()[:100])
+
+                # 4. 递归决策
+                if item["type"] == "dir" and depth < max_depth:
+                    if item["name"].lower() in interest_dirs or depth == 0:
+                        scan_queue.append((rel_path, depth + 1))
+
+        except Exception as e:
+            if config.verbose:
+                print(f"{Colors.WARNING}无法读取路径 {current_path}: {e}")
+            continue
+
+    return results
 
 
 def detect_programming_language(src_dir: Path) -> Optional[str]:
@@ -682,24 +845,46 @@ def create_context_bundle(
                         f"\n{Colors.WARNING}无法读取 {filename}: {e}{Colors.RESET}\n"
                     )
 
-    # 5. 主要入口文件
+    # 4. 主要入口文件
     content.append(f"\n{Colors.HEADER}主要入口文件{Colors.RESET}")
-    entry_points = ["__main__.py", "main.py", "app.py", "index.js", "main.go", "lib.rs"]
+    # 增加更多語言的入口文件
+    entry_points = [
+        "__main__.py", "main.py", "app.py", "cli.py", "core.py",  # Python
+        "index.js", "main.js", "app.js", "server.js",             # JS
+        "index.ts", "main.ts", "app.ts",                          # TS
+        "main.go", "lib.rs", "main.rs",                           # Go/Rust
+        "App.java", "Main.java",                                  # Java
+        "application.rb", "main.rb"                               # Ruby
+    ]
 
+    found_entries = 0
     for entry in entry_points:
-        entry_path = src_dir / entry
-        if entry_path.exists():
+        # 遞迴搜索入口文件 (不超過兩層)
+        matches = list(src_dir.glob(f"**/{entry}"))
+        for entry_path in matches:
+            if found_entries >= 10: break # 最多顯示 10 個入口文件
+            
+            # 計算相對路徑深度，避免抓到太深的文件
             try:
-                with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()[:50]  # 只读取前50行
-                    content.append(f"\n{Colors.HEADER}{entry}{Colors.RESET}")
-                    content.append("```python")
-                    content.extend(lines)
-                    content.append("```\n")
-            except Exception as e:
-                content.append(
-                    f"\n{Colors.WARNING}无法读取 {entry}: {e}{Colors.RESET}\n"
-                )
+                rel_path = entry_path.relative_to(src_dir)
+                if len(rel_path.parts) > 3: continue 
+            except ValueError:
+                continue
+
+            if entry_path.exists() and entry_path.is_file():
+                try:
+                    with open(entry_path, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()[:100]  # 增加到 100 行
+                        ext = entry.split(".")[-1] if "." in entry else "text"
+                        content.append(f"\n{Colors.HEADER}{rel_path}{Colors.RESET}")
+                        content.append(f"```{ext}")
+                        content.writelines(lines)
+                        content.append("```\n")
+                        found_entries += 1
+                except Exception as e:
+                    content.append(
+                        f"\n{Colors.WARNING}无法读取 {rel_path}: {e}{Colors.RESET}\n"
+                    )
 
     # 写入文件
     with open(output_path, "w", encoding="utf-8") as f:
@@ -713,18 +898,11 @@ def generate_skill_template(
     repo_url: str,
     language: Optional[str] = None,
     custom_template_path: Optional[str] = None,
+    entry_file: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> str:
     """
     生成技能模板
-
-    Args:
-        skill_name: 技能名称
-        repo_url: 仓库 URL
-        language: 编程语言
-        custom_template_path: 自定义模板路径
-
-    Returns:
-        SKILL.md 内容
     """
     # 优先使用自定义模板
     if custom_template_path:
@@ -732,99 +910,184 @@ def generate_skill_template(
         if template_path.exists():
             with open(template_path, "r", encoding="utf-8") as f:
                 template = f.read()
-                # 替换变量
                 template = template.replace("{{skill_name}}", skill_name)
                 template = template.replace("{{repo_url}}", repo_url)
                 template = template.replace("{{language}}", language or "Unknown")
+                template = template.replace("{{description}}", description or f"Generated from {repo_url}.")
                 return template
 
+    # 根據語言生成安裝指南
+    install_guide = ""
+    run_guide = ""
+    lang_lower = (language or "").lower()
+    
+    # 默認入口處理
+    entry = entry_file or "src/main.py"
+    
+    if "python" in lang_lower:
+        install_guide = "pip install -r requirements.txt"
+        run_guide = f"python3 {entry} --help"
+    elif "node" in lang_lower or "javascript" in lang_lower or "typescript" in lang_lower:
+        install_guide = "npm install"
+        run_guide = f"node {entry} --help"
+    elif "go" in lang_lower:
+        install_guide = "go mod download"
+        run_guide = f"go run {entry} --help"
+    elif "rust" in lang_lower:
+        install_guide = "cargo build"
+        run_guide = f"cargo run -- --help"
+    else:
+        install_guide = "# 請查看 context_bundle.md 獲取安裝說明"
+        run_guide = f"# 請查看 context_bundle.md 獲取運行說明\n./{entry} --help"
+
+    # 根据描述推断角色和调用场景
+    desc_raw = description or "一个高效的开源工具"
+    
+    # 尝试自动翻译 (通过简单的正则匹配或规则，而不是死板的模板)
+    def auto_translate(text: str) -> str:
+        # 如果已经是中文，直接返回
+        if re.search(r'[\u4e00-\u9fa5]', text):
+            return text
+            
+        # 极简映射翻译逻辑 (应对常见关键词)
+        translation_map = {
+            "Fast, unopinionated, minimalist web framework for node": "快速、灵活、极简的 Node.js Web 框架",
+            "A feature-rich command-line audio/video downloader": "功能丰富的命令行音频/视频下载工具",
+            "Fast, unopinionated, minimalist web framework for Node.js": "快速、灵活、极简的 Node.js Web 框架",
+        }
+        
+        for eng, chn in translation_map.items():
+            if eng.lower() in text.lower():
+                return chn
+        
+        # 简单的正则替换翻译 (自动处理一些常见结构)
+        replacements = [
+            (r'A (.*) for (.*)', r'一个用于 \2 的 \1'),
+            (r'(.*) implementation of (.*)', r'\2 的 \1 实现'),
+            (r'Simple (.*)', r'简单的 \1'),
+            (r'Official (.*)', r'官方 \1'),
+            (r'Modern (.*)', r'现代化的 \1'),
+            (r'Fast (.*)', r'快速的 \1'),
+            (r'Flexible (.*)', r'灵活的 \1'),
+            (r'Lightweight (.*)', r'轻量级的 \1'),
+            (r'Open source (.*)', r'开源的 \1'),
+            (r'Powerful (.*)', r'功能强大的 \1'),
+            (r'Python (.*)', r'Python \1'),
+            (r'JavaScript (.*)', r'JavaScript \1'),
+            (r'TypeScript (.*)', r'TypeScript \1'),
+            (r'Go (.*)', r'Go \1'),
+            (r'Rust (.*)', r'Rust \1'),
+            (r'CLI (.*)', r'命令行 \1'),
+            (r'Web (.*)', r'Web \1'),
+            (r'Framework', r'框架'),
+            (r'Library', r'库'),
+            (r'Tool', r'工具'),
+            (r'Plugin', r'插件'),
+            (r'Client', r'客户端'),
+            (r'Server', r'服务端'),
+            (r'API', r'接口'),
+            (r'Documentation', r'文档'),
+            (r'Examples', r'示例'),
+            (r'Utility', r'工具'),
+            (r'Application', r'应用'),
+            (r'Downloader', r'下载器'),
+        ]
+        
+        result = text
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+            
+        return result
+
+    desc_zh = auto_translate(desc_raw)
+
+    # 简单的关键词提取作为 tags
+    tags = [skill_name.replace("-skill", ""), language] if language else [skill_name.replace("-skill", "")]
+    
+    # 自动从描述中提取更多 tags
+    potential_tags = {
+        "download": ["downloader", "下载器"],
+        "video": ["video", "视频"],
+        "audio": ["audio", "音频"],
+        "music": ["music", "音乐"],
+        "web": ["web", "网页"],
+        "framework": ["framework", "框架"],
+        "api": ["api", "接口"],
+        "cli": ["cli", "命令行"],
+        "tool": ["tool", "工具"],
+        "gui": ["gui", "界面"],
+        "library": ["library", "库"],
+        "client": ["client", "客户端"],
+        "server": ["server", "服务端"],
+        "docker": ["docker", "容器化"],
+        "cloud": ["cloud", "云原生"],
+    }
+    
+    for keyword, associated_tags in potential_tags.items():
+        if keyword in desc_raw.lower() or keyword in desc_zh.lower():
+            for t in associated_tags:
+                if t not in tags:
+                    tags.append(t)
+    
     # 默认模板
     base_template = f"""---
 name: {skill_name}
-description: [DRAFT] Generated from {repo_url}.
+description: {desc_zh}
+tags: {tags}
 ---
 
 # {skill_name}
 
-> Auto-generated by GitHub Skill Forge
+## 角色设定
+你是一个精通 {skill_name} 的专家级 Agent。你不仅熟悉该工具的核心逻辑，还能灵活运用它解决实际问题。
+你的目标是作为用户的「技术副驾驶」，通过 {repo_url} 提供的能力，高效完成以下任务：{desc_zh}。
 
-## 状态
-**上下文已加载**: 查看 `context_bundle.md` 了解完整项目详情。
+## 何时调用
+- **核心需求**: 当用户需要执行「{desc_zh}」相关的操作时。
+- **自动化流**: 需要通过 `scripts/` 目录下的脚本进行批量处理或复杂逻辑封装时。
+- **集成开发**: 在开发过程中需要调用该项目的 API、库或 CLI 工具作为底层支撑时。
 
 ## 功能概述
+该项目是一个基于 {language or "未知语言"} 构建的成熟方案。
+### 核心价值
+{desc_zh}
 
-### 编程语言
-{language or "Unknown"}
-
-### 主要功能
-（请根据 context_bundle.md 填写）
+### 关键能力
+1. **深度集成**: 支持通过 `scripts/` 编写自定义 Python/JS 脚本，直接调用 `src/` 中的核心模块。
+2. **灵活配置**: 可根据 `context_bundle.md` 中的文档说明，通过环境变量或配置文件调整运行行为。
+3. **高效执行**: 针对 {tags} 等场景进行了深度优化。
 
 ## 使用方法
 
-### 基本用法
-
+### 1. 基础安装
+在当前技能目录下执行依赖安装，确保环境就绪：
 ```bash
-# 请根据实际入口文件调整
-python3 src/main.py --help
+{install_guide}
 ```
 
-## 依赖项
-
-### 安装依赖
-
+### 2. 命令行直调
+如果只需快速执行单次任务，可直接运行：
 ```bash
-# Python
-pip install -r requirements.txt
-
-# Node.js
-npm install
-
-# Go
-go mod download
-
-# Rust
-cargo build --release
+{run_guide}
 ```
 
-## 高级用法
-
-### 配置选项
-
-### 命令行参数
-
-## 示例
-
-### 示例 1
-
-```bash
-python3 src/main.py example
+### 3. 脚本化进阶（推荐）
+对于复杂任务，建议在 `scripts/` 目录下创建包装脚本。
+**示例脚本结构 (Python)**:
+```python
+import sys
+import os
+# 自动将 src 添加到路径
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+# 接下来可以 import 核心模块进行调用
 ```
 
-## 故障排除
-
-### 常见问题
-
-#### 问题 1
-
-**症状**: 
-
-**解决方案**: 
-
-## 源信息
-
-- 仓库: {repo_url}
-- 本地路径: ./src/
-- 语言: {language or "Unknown"}
-
-## 下一步（Agent 任务）
-
-1. 阅读 `context_bundle.md` 了解完整项目信息
-2. 理解工具的用途和使用方法
-3. 重写此 SKILL.md，添加清晰的"使用示例"和"依赖项"部分
-4. 如有必要，在 `scripts/` 目录创建包装脚本
-5. 验证工具功能正常
+## 执行步骤
+1. **需求分析**: 根据用户输入的具体任务（如：下载某个链接），匹配该工具的最佳运行参数。
+2. **环境检查**: 确认 `context_bundle.md` 中提到的依赖和配置是否已正确加载。
+3. **任务执行**: 优先检查 `scripts/` 目录下是否有现成的包装脚本，若无则根据 `run_guide` 直接执行。
+4. **结果交付**: 处理工具输出的数据，将其转化为用户可理解的最终成果。
 """
-
     return base_template
 
 
@@ -848,16 +1111,33 @@ def clone_repository(url: str, target_dir: Path, config: ForgeConfig) -> bool:
             print(f"{Colors.ERROR}目标目录已存在: {target_dir}")
             return False
 
+    # 提取 owner 和 repo
+    parts = url.rstrip("/").split("/")
+    if len(parts) >= 2:
+        repo_path = f"{parts[-2]}/{parts[-1]}"
+        # 移除 .git 后缀
+        if repo_path.endswith(".git"):
+            repo_path = repo_path[:-4]
+    else:
+        repo_path = ""
+
     # 尝试克隆
     clone_urls = []
 
-    if config.proxy_enabled:
-        # 代理 URL
-        proxy_url = url.replace("github.com", config.proxy_url)
-        clone_urls.append(proxy_url)
+    # 1. 尝试配置中的所有镜像
+    for mirror_base in config.clone_mirrors:
+        if repo_path:
+            # 确保 mirror_base 结尾没有斜杠，repo_path 开头没有斜杠
+            base = mirror_base.rstrip("/")
+            clone_urls.append(f"{base}/{repo_path}")
+        else:
+            # 如果解析失败，回退到原始替换逻辑
+            proxy_url = url.replace("github.com", mirror_base.replace("https://", "").replace("http://", ""))
+            clone_urls.append(proxy_url)
 
-    # 原始 URL
-    clone_urls.append(url)
+    # 2. 确保原始 URL 在最后作为保底
+    if url not in clone_urls:
+        clone_urls.append(url)
 
     for attempt in range(config.max_retries):
         for clone_url in clone_urls:
@@ -867,17 +1147,19 @@ def clone_repository(url: str, target_dir: Path, config: ForgeConfig) -> bool:
 
             try:
                 # 构建 git 命令
-                cmd = [
-                    "git",
-                    "clone",
-                    "--depth",
-                    str(config.clone_depth),
-                    clone_url,
-                    str(target_dir),
-                ]
+                # 在 Windows 下，如果直接使用列表，subprocess 有时无法正确处理 shell 别名或路径
+                # 尝试使用 shell=True 并直接拼接字符串（注意安全，这里 clone_url 是可控的）
+                # 检查 git 是否可用
+                try:
+                    subprocess.run(["git", "--version"], capture_output=True, check=True, shell=True)
+                    cmd_str = f'git clone --depth {config.clone_depth} "{clone_url}" "{target_dir}"'
+                except:
+                    # 如果 git 失败，尝试完全限定路径或报错
+                    cmd_str = f'git clone --depth {config.clone_depth} "{clone_url}" "{target_dir}"'
 
+                print(f"{Colors.INFO}执行命令: {cmd_str}")
                 result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=config.timeout
+                    cmd_str, capture_output=True, text=True, timeout=config.timeout, shell=True
                 )
 
                 if result.returncode == 0:
@@ -949,7 +1231,6 @@ def create_skill_structure(skill_name: str, target_dir: Path) -> Dict[str, Path]
         "skill": target_dir,
         "src": target_dir / "src",
         "scripts": target_dir / "scripts",
-        "references": target_dir / "references",
     }
 
     for path in paths.values():
@@ -964,6 +1245,8 @@ def create_default_files(
     paths: Dict[str, Path],
     language: Optional[str] = None,
     custom_template_path: Optional[str] = None,
+    description: Optional[str] = None,
+    entry_file: Optional[str] = None,
 ) -> None:
     """
     创建默认文件
@@ -974,11 +1257,13 @@ def create_default_files(
         paths: 路径字典
         language: 编程语言
         custom_template_path: 自定义模板路径
+        description: 项目描述
+        entry_file: 入口文件路径
     """
     # 1. 创建 SKILL.md
     skill_md_path = paths["skill"] / "SKILL.md"
     template = generate_skill_template(
-        skill_name, repo_url, language, custom_template_path
+        skill_name, repo_url, language, custom_template_path, entry_file, description
     )
     with open(skill_md_path, "w", encoding="utf-8") as f:
         f.write(template)
@@ -1065,20 +1350,77 @@ Generated by [GitHub Skill Forge](https://github.com)
             f.write(readme_content)
 
 
+def create_online_context_bundle(
+    online_data: Dict[str, Any],
+    output_path: Path,
+    config: ForgeConfig,
+) -> None:
+    """
+    基于在线数据创建上下文聚合文件
+    """
+    content = []
+
+    # 1. 项目结构
+    content.append(f"{Colors.HEADER}项目结构 (全在线递归扫描){Colors.RESET}")
+    content.append("```")
+    # 排序树结构
+    tree = sorted(online_data.get("tree", []))
+    content.append("\n".join(tree))
+    content.append("```\n")
+
+    # 2. 编程语言
+    lang = online_data.get("language", "Unknown")
+    content.append(f"{Colors.HEADER}主要语言: {Colors.RESET}{lang}\n")
+
+    # 3. 关键文档
+    content.append(f"{Colors.HEADER}关键文档内容{Colors.RESET}")
+    for name, text in online_data.get("key_docs", {}).items():
+        content.append(f"\n{Colors.HEADER}文件: {name}{Colors.RESET}")
+        if len(text) > config.max_doc_size:
+            text = text[:config.max_doc_size] + f"\n\n{Colors.YELLOW}... (文档截断){Colors.RESET}"
+        content.append(text)
+        content.append("\n" + "-" * 60 + "\n")
+
+    # 4. 核心代码预览
+    if online_data.get("core_code"):
+        content.append(f"\n{Colors.HEADER}核心代码预览 (Top 100 Lines){Colors.RESET}")
+        for name, code in online_data.get("core_code", {}).items():
+            ext = name.split(".")[-1] if "." in name else ""
+            content.append(f"\n{Colors.HEADER}文件: {name}{Colors.RESET}")
+            content.append(f"```{ext}")
+            content.append(code)
+            content.append("```\n")
+
+    # 5. 入口文件预览 (在线版)
+    if online_data.get("entry_files"):
+        content.append(f"\n{Colors.HEADER}入口文件预览 (Top 100 Lines){Colors.RESET}")
+        for name, code in online_data.get("entry_files", {}).items():
+            ext = name.split(".")[-1] if "." in name else ""
+            content.append(f"\n{Colors.HEADER}文件: {name}{Colors.RESET}")
+            content.append(f"```{ext}")
+            content.append(code)
+            content.append("```\n")
+
+    # 5. 依赖项
+    content.append(f"\n{Colors.HEADER}依赖项详情{Colors.RESET}")
+    for name, text in online_data.get("dependencies", {}).items():
+        content.append(f"\n{Colors.HEADER}{name}{Colors.RESET}")
+        content.append("```")
+        content.append(text)
+        content.append("```\n")
+
+    # 写入文件
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(content))
+
+    print(f"{Colors.SUCCESS}已生成在线上下文包: {output_path}")
+
+
 def process_single_repository(
     url: str, skill_name: Optional[str], config: ForgeConfig, base_output_dir: Path
 ) -> bool:
     """
-    处理单个仓库
-
-    Args:
-        url: 仓库 URL
-        skill_name: 技能名称（可选）
-        config: 配置
-        base_output_dir: 输出基础目录
-
-    Returns:
-        是否处理成功
+    处理单个仓库 (全在线模式，带克隆回退)
     """
     print(f"\n{Colors.HEADER}{'=' * 60}{Colors.RESET}")
     print(f"{Colors.HEADER}处理仓库: {url}{Colors.RESET}")
@@ -1089,74 +1431,178 @@ def process_single_repository(
         print(f"{Colors.ERROR}无效的 GitHub URL: {url}")
         return False
 
-    # 2. 确定技能名称
+    # 3. 确定技能名称
     if skill_name is None:
-        skill_name = config.default_skill_name.format(repo_name=get_repo_name(url))
+        try:
+            _, repo_name = get_repo_info(url)
+            skill_name = f"{repo_name}-skill"
+        except Exception:
+            skill_name = f"{get_repo_name(url)}-skill"
 
-    # 3. 检查安全性（如果启用）
-    if not config.quiet:
-        print(f"{Colors.INFO}检查仓库安全性...")
-        is_safe, safety_info = check_repository_safety(url)
-        if not is_safe:
-            print(f"{Colors.WARNING}安全警告: {safety_info}")
-            if not config.force:
-                print(f"{Colors.INFO}使用 --force 强制继续")
-                return False
-        else:
-            print(f"{Colors.SUCCESS}安全检查通过: {safety_info}")
+    target_dir = base_output_dir / skill_name
+    
+    # [Debug] 打印生成的 target_dir
+    print(f"{Colors.INFO}目标技能目录: {target_dir}")
+    
+    paths = create_skill_structure(skill_name, target_dir)
 
-    # 4. 试运行模式
+    # 4. 检查安全性
+    repo_description = None
+    if not config.no_safety_check:
+        print(f"{Colors.INFO}检查仓库安全性 (阈值: {config.min_stars} Stars)...")
+        try:
+            is_safe, safety_info, repo_description = check_repository_safety(url, config)
+            if not is_safe:
+                print(f"{Colors.WARNING}金标筛选未通过: {safety_info}")
+                if not config.force:
+                    print(f"{Colors.INFO}使用 --force 强制继续")
+                    return False
+                else:
+                    print(f"{Colors.WARNING}已使用 --force，忽略安全警告继续...")
+            else:
+                print(f"{Colors.SUCCESS}金标验证成功: {safety_info}")
+        except Exception as e:
+            print(f"{Colors.WARNING}无法在线检查安全性，将跳过此步: {e}")
+
+    # 5. 试运行模式
     if config.dry_run:
         print(f"{Colors.INFO}试运行模式 - 以下操作将被执行:")
-        print(f"  1. 克隆 {url}")
-        print(f"  2. 创建目录结构: {base_output_dir / skill_name}")
+        print(f"  1. 在线扫描 {url}")
+        print(f"  2. 创建目录结构: {target_dir}")
         print(f"  3. 生成 context_bundle.md")
-        print(f"  4. 生成 SKILL.md")
         return True
 
-    # 5. 创建目录结构
-    target_dir = base_output_dir / skill_name
-    paths = create_skill_structure(skill_name, target_dir)
-    print(f"{Colors.SUCCESS}已创建目录结构: {target_dir}")
+    # 6. 在线扫描仓库 (尝试在线模式)
+    online_success = False
+    try:
+        print(f"{Colors.PROGRESS}嘗試全在線掃描模式 (Zero-Clone)...")
+        online_data = online_repo_scanner(url, config)
+        
+        # 验证是否真的抓到了数据 (tree 不应为空)
+        if online_data and online_data.get("tree"):
+            # 获取入口文件路径用于 SKILL.md
+            entry_file = None
+            if online_data.get("entry_files"):
+                entry_file = list(online_data["entry_files"].keys())[0]
 
-    # 6. 克隆仓库
-    if not clone_repository(url, paths["src"], config):
-        print(f"{Colors.ERROR}克隆失败")
-        # 清理已创建的目录
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        return False
+            # 创建上下文包 (在线版)
+            bundle_path = paths["skill"] / "context_bundle.md"
+            create_online_context_bundle(online_data, bundle_path, config)
+            
+            # 创建默认文件
+            language = online_data.get("language")
+            create_default_files(
+                skill_name, 
+                url, 
+                paths, 
+                language, 
+                config.custom_template_path,
+                description=repo_description,
+                entry_file=entry_file
+            )
+            online_success = True
+            
+            # 在線模式下，如果路徑中意外產生了 src 且不為空，也進行清理（保持純淨）
+            src_dir = paths["src"]
+            if src_dir.exists() and any(src_dir.iterdir()):
+                print(f"{Colors.INFO}正在清理在线模式产生的残留文件...")
+                try:
+                    def on_rm_error(func, path, exc_info):
+                        os.chmod(path, 0o777)
+                        func(path)
+                    shutil.rmtree(src_dir, onerror=on_rm_error)
+                    src_dir.mkdir(parents=True, exist_ok=True) # 保持目錄結構但清空內容
+                except Exception:
+                    pass
 
-    # 7. 清理 .git 文件夹
-    cleanup_git_folder(paths["src"])
+            print(f"{Colors.SUCCESS}全在线扫描成功！")
+        else:
+            print(f"{Colors.WARNING}在线扫描未返回有效数据，可能由于速率限制或仓库为空。")
+    except Exception as e:
+        print(f"{Colors.WARNING}全在线扫描失败: {e}")
+        if config.verbose:
+            import traceback
+            traceback.print_exc()
 
-    # 8. 检测编程语言
-    language = detect_programming_language(paths["src"])
-    if language:
-        print(f"{Colors.SUCCESS}检测到编程语言: {language}")
+    # 7. 保底方案: 自动回退到最小化克隆模式
+    if not online_success:
+        print(f"\n{Colors.WARNING}正在執行保底方案: 最小化克隆模式 (Clone Depth 1)...")
+        
+        # 重新创建/清理 src 目录
+        src_dir = paths["src"]
+        if src_dir.exists():
+            try:
+                def on_rm_error(func, path, exc_info):
+                    os.chmod(path, 0o777)
+                    func(path)
+                shutil.rmtree(src_dir, onerror=on_rm_error)
+            except Exception:
+                pass
+        src_dir.mkdir(parents=True, exist_ok=True)
+        
+        # [Debug] 强制打印克隆前的状态
+        print(f"{Colors.INFO}準備克隆到: {src_dir.absolute()}")
+        
+        if clone_repository(url, src_dir, config):
+            # 清理 .git
+            cleanup_git_folder(src_dir)
+            
+            # 扫描本地代码生成聚合文件
+            bundle_path = paths["skill"] / "context_bundle.md"
+            create_context_bundle(
+                src_dir,
+                bundle_path,
+                config.max_file_count,
+                config.max_doc_size,
+                config.skip_patterns
+            )
+            
+            # 检测语言并生成默认文件
+            language = detect_programming_language(src_dir)
+            
+            # 本地模式也嘗試找入口文件
+            entry_file = None
+            entry_points_list = [
+                "__main__.py", "main.py", "app.py", "index.js", "main.js", 
+                "app.js", "index.ts", "main.go", "main.rs"
+            ]
+            for ep in entry_points_list:
+                matches = list(src_dir.glob(f"**/{ep}"))
+                if matches:
+                    entry_file = str(matches[0].relative_to(src_dir))
+                    break
 
-    # 9. 创建上下文包
-    bundle_path = paths["skill"] / "context_bundle.md"
-    create_context_bundle(
-        paths["src"],
-        bundle_path,
-        config.max_file_count,
-        config.max_doc_size,
-        config.skip_patterns,
-    )
+            create_default_files(
+                skill_name, 
+                url, 
+                paths, 
+                language, 
+                config.custom_template_path,
+                description=repo_description,
+                entry_file=entry_file
+            )
+            
+            # 任務完成後，如果是保底克隆模式且配置了清理
+            if src_dir.exists():
+                print(f"{Colors.INFO}正在清理克隆的源代碼目錄...")
+                try:
+                    def on_rm_error(func, path, exc_info):
+                        os.chmod(path, 0o777)
+                        func(path)
+                    shutil.rmtree(src_dir, onerror=on_rm_error)
+                except Exception as e:
+                    print(f"{Colors.WARNING}清理失敗: {e}")
 
-    # 10. 创建默认文件
-    create_default_files(skill_name, url, paths, language, config.custom_template_path)
+            print(f"{Colors.SUCCESS}保底克隆模式成功完成！")
+        else:
+            print(f"{Colors.ERROR}所有尝试均已失败，请检查网络连接或仓库权限。")
+            return False
 
     print(f"\n{Colors.SUCCESS}{'=' * 60}")
-    print(f"{Colors.SUCCESS}技能锻造成功!")
+    print(f"{Colors.SUCCESS}技能锻造完成!")
     print(f"{Colors.SUCCESS}{'=' * 60}")
     print(f"{Colors.INFO}技能目录: {target_dir}")
-    print(f"{Colors.INFO}下一步操作:")
-    print(f"  1. 阅读 {bundle_path}")
-    print(f"  2. 更新 {paths['skill'] / 'SKILL.md'}")
-    print(f"  3. 验证工具功能")
-
+    
     return True
 
 
@@ -1306,6 +1752,10 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument("--version", action="version", version="%(prog)s v2.0")
 
+    parser.add_argument(
+        "--min-stars", type=int, default=20, help="金标筛选阈值（默认: 20 Stars）"
+    )
+
     return parser.parse_args()
 
 
@@ -1353,6 +1803,10 @@ def main() -> int:
         config.max_retries = args.max_retries
     if args.timeout:
         config.timeout = args.timeout
+    if args.no_safety_check:
+        config.no_safety_check = True
+    if args.min_stars:
+        config.min_stars = args.min_stars
 
     # 确定输出目录
     if args.output:
